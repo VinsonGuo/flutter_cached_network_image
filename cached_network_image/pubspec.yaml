@@ -18,6 +18,7 @@ dependencies:
   flutter:
     sdk: flutter
   flutter_cache_manager: ^3.4.1
+  flutter_svg: ^2.0.10
   octo_image: ^2.1.0
 
 dev_dependencies:

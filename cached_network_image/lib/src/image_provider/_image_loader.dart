@@ -9,6 +9,7 @@ import 'package:cached_network_image_platform_interface'
     show ImageLoader;
 import 'package:flutter/material.dart';
 import 'package:flutter_cache_manager/flutter_cache_manager.dart';
+import 'package:flutter_svg/flutter_svg.dart';
 
 /// ImageLoader class to load images on IO platforms.
 class ImageLoader implements platform.ImageLoader {
@@ -121,8 +122,15 @@ class ImageLoader implements platform.ImageLoader {
         if (result is FileInfo) {
           final file = result.file;
           final bytes = await file.readAsBytes();
-          final decoded = await decode(bytes);
-          yield decoded;
+
+          // Check if the file is an SVG
+          if (_isSvg(file.path, bytes)) {
+            final codec = await _decodeSvg(bytes);
+            yield codec;
+          } else {
+            final decoded = await decode(bytes);
+            yield decoded;
+          }
         }
       }
     } on Object catch (error, stackTrace) {
@@ -137,4 +145,88 @@ class ImageLoader implements platform.ImageLoader {
       await chunkEvents.close();
     }
   }
+
+  bool _isSvg(String filePath, Uint8List bytes) {
+    // Check by file extension
+    if (filePath.toLowerCase().endsWith('.svg')) {
+      return true;
+    }
+
+    // Check by content (SVG files start with XML declaration or <svg)
+    final content = String.fromCharCodes(bytes.take(20));
+    final trimmed = content.trim();
+    if (trimmed.startsWith('<?xml') ||
+        trimmed.startsWith('<svg') ||
+        trimmed.startsWith('<!DOCTYPE svg')) {
+      return true;
+    }
+
+    return false;
+  }
+
+  Future<ui.Codec> _decodeSvg(Uint8List bytes,) async {
+    // Use SvgBytesLoader for better encoding handling
+    const scale = 3.0;
+    final pictureInfo = await vg.loadPicture(
+      SvgBytesLoader(bytes),
+      null,
+    );
+
+    final picture = pictureInfo.picture;
+    final size = pictureInfo.size;
+
+    double targetWidth = size.width * scale;
+    double targetHeight = size.height * scale;
+
+
+    final recorder = ui.PictureRecorder();
+    final canvas = ui.Canvas(recorder);
+
+    canvas.scale(scale);
+    canvas.drawPicture(picture);
+
+    final image = await recorder.endRecording().toImage(
+      targetWidth.ceil(),
+      targetHeight.ceil(),
+    );
+    picture.dispose();
+
+    // Create a single-frame codec from the image with scale info
+    return _SingleFrameCodec(image);
+  }
+}
+
+/// A simple single-frame codec for SVG images
+class _SingleFrameCodec implements ui.Codec {
+  _SingleFrameCodec(this._image);
+
+  final ui.Image _image;
+
+  @override
+  int get frameCount => 1;
+
+  @override
+  int get repetitionCount => 0;
+
+  @override
+  Future<ui.FrameInfo> getNextFrame() async {
+    return _SingleFrameInfo(_image.clone());
+  }
+
+  @override
+  void dispose() {
+    _image.dispose();
+  }
+}
+
+class _SingleFrameInfo implements ui.FrameInfo {
+  _SingleFrameInfo(this._image);
+
+  final ui.Image _image;
+
+  @override
+  ui.Image get image => _image;
+
+  @override
+  Duration get duration => Duration.zero;
 }
