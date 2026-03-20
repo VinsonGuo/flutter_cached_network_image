@@ -125,7 +125,7 @@ class ImageLoader implements platform.ImageLoader {
 
           // Check if the file is an SVG
           if (_isSvg(file.path, bytes)) {
-            final codec = await _decodeSvg(bytes);
+            final codec = await _decodeSvg(file.path, bytes);
             yield codec;
           } else {
             final decoded = await decode(bytes);
@@ -164,32 +164,36 @@ class ImageLoader implements platform.ImageLoader {
     return false;
   }
 
-  Future<ui.Codec> _decodeSvg(Uint8List bytes,) async {
-    // Use SvgBytesLoader for better encoding handling
-    const scale = 3.0;
-    final pictureInfo = await vg.loadPicture(
-      SvgBytesLoader(bytes),
-      null,
-    );
+  Future<ui.Codec> _decodeSvg(String path, Uint8List bytes,) async {
+    final cache = SvgPictureCache.instance;
+    var image = cache.get(path);
+    if (image == null) {
+      final pictureInfo = await vg.loadPicture(
+        SvgBytesLoader(bytes),
+        null,
+      );
 
-    final picture = pictureInfo.picture;
-    final size = pictureInfo.size;
+      final scale = ui.window.devicePixelRatio;
+      final picture = pictureInfo.picture;
+      final size = pictureInfo.size;
 
-    double targetWidth = size.width * scale;
-    double targetHeight = size.height * scale;
+      double targetWidth = size.width * scale;
+      double targetHeight = size.height * scale;
 
 
-    final recorder = ui.PictureRecorder();
-    final canvas = ui.Canvas(recorder);
+      final recorder = ui.PictureRecorder();
+      final canvas = ui.Canvas(recorder);
 
-    canvas.scale(scale);
-    canvas.drawPicture(picture);
+      canvas.scale(scale);
+      canvas.drawPicture(picture);
 
-    final image = await recorder.endRecording().toImage(
-      targetWidth.ceil(),
-      targetHeight.ceil(),
-    );
-    picture.dispose();
+      image = await recorder.endRecording().toImage(
+        targetWidth.ceil(),
+        targetHeight.ceil(),
+      );
+      cache.put(path, image);
+      picture.dispose();
+    }
 
     // Create a single-frame codec from the image with scale info
     return _SingleFrameCodec(image);
@@ -215,7 +219,6 @@ class _SingleFrameCodec implements ui.Codec {
 
   @override
   void dispose() {
-    _image.dispose();
   }
 }
 
@@ -229,4 +232,36 @@ class _SingleFrameInfo implements ui.FrameInfo {
 
   @override
   Duration get duration => Duration.zero;
+}
+
+class SvgPictureCache {
+  SvgPictureCache._();
+
+  static final instance = SvgPictureCache._();
+
+  final _cache = <String, ui.Image>{};
+
+  final _lru = <String>[];
+  final int maxEntries = 50;
+
+  ui.Image? get(String key) {
+    final value = _cache[key];
+    if (value != null) {
+      _lru.remove(key);
+      _lru.add(key);
+    }
+    return value;
+  }
+
+  void put(String key, ui.Image image) {
+    if (_cache.containsKey(key)) return;
+
+    if (_cache.length >= maxEntries) {
+      final oldest = _lru.removeAt(0);
+      _cache.remove(oldest)?.dispose();
+    }
+
+    _cache[key] = image;
+    _lru.add(key);
+  }
 }
