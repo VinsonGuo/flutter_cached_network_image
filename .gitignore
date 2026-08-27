@@ -39,6 +39,7 @@ version
 
 # Flutter/Dart/Pub related
 **/doc/api/
+**/pubspec_overrides.yaml
 .dart_tool/
 .flutter-plugins
 .packages
