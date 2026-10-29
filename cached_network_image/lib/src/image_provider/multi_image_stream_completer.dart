@@ -15,16 +15,24 @@ class MultiImageStreamCompleter extends ImageStreamCompleter {
   /// should be a stream with the images that should be shown. The
   /// [chunkEvents] should indicate the [ImageChunkEvent]s of the first image
   /// to show.
+  ///
+  /// Takes ownership of every codec delivered on [codec]; do not reuse them
+  /// elsewhere. Replaced codecs, codecs held at disposal, and late results
+  /// are disposed by this completer.
   MultiImageStreamCompleter({
     required Stream<ui.Codec> codec,
     required this._scale,
+    String? debugLabel,
     Stream<ImageChunkEvent>? chunkEvents,
     InformationCollector? informationCollector,
   }) : _informationCollector = informationCollector {
-    codec.listen(
+    this.debugLabel = debugLabel;
+    _codecSubscription = codec.listen(
       (event) {
-        if (_timer != null) {
-          _nextImageCodec = event;
+        if (_disposed) {
+          event.dispose();
+        } else if (_timer != null) {
+          _replacePendingCodec(event);
         } else {
           _handleCodecReady(event);
         }
@@ -69,27 +77,34 @@ class MultiImageStreamCompleter extends ImageStreamCompleter {
 
   // How many frames have been emitted so far.
   int _framesEmitted = 0;
+  bool _isDecoding = false;
   Timer? _timer;
+  StreamSubscription<ui.Codec>? _codecSubscription;
   StreamSubscription<ImageChunkEvent>? _chunkSubscription;
 
   // Used to guard against registering multiple _handleAppFrame callbacks for the same frame.
   bool _frameCallbackScheduled = false;
 
-  /// We must avoid disposing a completer if it never had a listener, even
-  /// if all [keepAlive] handles get disposed.
-  bool __hadAtLeastOneListener = false;
-
-  bool __disposed = false;
+  // Guards asynchronous work after the base class invokes onDisposed.
+  bool _disposed = false;
 
   void _switchToNewCodec() {
-    _framesEmitted = 0;
     _timer = null;
     _handleCodecReady(_nextImageCodec!);
-    _nextImageCodec = null;
   }
 
   void _handleCodecReady(ui.Codec codec) {
+    // Every activation supersedes a pending refresh, even when listener
+    // removal cancelled its timer before a newer codec arrived.
+    _replacePendingCodec(codec);
+    _nextImageCodec = null;
+    if (_codec != codec) _codec?.dispose();
     _codec = codec;
+    _framesEmitted = 0;
+    _isDecoding = false;
+    // A frame still waiting from the previous codec must not be shown as part
+    // of this one.
+    _discardNextFrame();
 
     if (hasListeners) {
       _decodeNextFrameAndSchedule();
@@ -98,19 +113,28 @@ class MultiImageStreamCompleter extends ImageStreamCompleter {
 
   void _handleAppFrame(Duration timestamp) {
     _frameCallbackScheduled = false;
-    if (!hasListeners) return;
+    if (!hasListeners || _nextFrame == null) return;
     if (_isFirstFrame() || _hasFrameDurationPassed(timestamp)) {
-      _emitFrame(ImageInfo(image: _nextFrame!.image, scale: _scale));
-      _shownTimestamp = timestamp;
-      _frameDuration = _nextFrame!.duration;
+      // Transfer ownership before callbacks can remove the last listener.
+      final frame = _nextFrame!;
+      final codec = _codec!;
       _nextFrame = null;
+      _emitFrame(
+        ImageInfo(image: frame.image, scale: _scale, debugLabel: debugLabel),
+      );
+      _shownTimestamp = timestamp;
+      _frameDuration = frame.duration;
+      if (_disposed || _codec != codec) return;
       if (_framesEmitted % _codec!.frameCount == 0 && _nextImageCodec != null) {
         _switchToNewCodec();
       } else {
+        if (!hasListeners) return;
         final completedCycles = _framesEmitted ~/ _codec!.frameCount;
         if (_codec!.repetitionCount == -1 ||
             completedCycles <= _codec!.repetitionCount) {
           _decodeNextFrameAndSchedule();
+        } else {
+          _timer = null;
         }
       }
       return;
@@ -128,9 +152,17 @@ class MultiImageStreamCompleter extends ImageStreamCompleter {
   }
 
   Future<void> _decodeNextFrameAndSchedule() async {
+    if (_isDecoding) {
+      return;
+    }
+    _isDecoding = true;
+    final codec = _codec!;
+    final ui.FrameInfo frame;
     try {
-      _nextFrame = await _codec!.getNextFrame();
+      frame = await codec.getNextFrame();
     } on Object catch (exception, stack) {
+      if (_disposed || _codec != codec) return;
+      _isDecoding = false;
       reportError(
         context: ErrorDescription('resolving an image frame'),
         exception: exception,
@@ -140,19 +172,22 @@ class MultiImageStreamCompleter extends ImageStreamCompleter {
       );
       return;
     }
-    if (_codec!.frameCount == 1) {
-      // ImageStreamCompleter listeners removed while waiting for next frame to
-      // be decoded.
-      // There's no reason to emit the frame without active listeners.
-      if (!hasListeners) {
-        return;
-      }
-
-      // This is not an animated image, just return it and don't schedule more
-      // frames.
-      _emitFrame(ImageInfo(image: _nextFrame!.image, scale: _scale));
+    // Replacing the codec or disposing the completer invalidates this frame.
+    if (_disposed || _codec != codec) {
+      frame.image.dispose();
       return;
     }
+    _isDecoding = false;
+    if (codec.frameCount == 1) {
+      // This is not an animated image, just return it and don't schedule more
+      // frames.
+      _emitFrame(
+        ImageInfo(image: frame.image, scale: _scale, debugLabel: debugLabel),
+      );
+      return;
+    }
+    _discardNextFrame();
+    _nextFrame = frame;
     _scheduleAppFrame();
   }
 
@@ -165,14 +200,21 @@ class MultiImageStreamCompleter extends ImageStreamCompleter {
   }
 
   void _emitFrame(ImageInfo imageInfo) {
-    setImage(imageInfo);
+    // Callbacks may synchronously activate a new codec and reset this count.
     _framesEmitted += 1;
+    setImage(imageInfo);
   }
 
   @override
   void addListener(ImageStreamListener listener) {
-    __hadAtLeastOneListener = true;
-    if (!hasListeners && _codec != null) _decodeNextFrameAndSchedule();
+    if (!hasListeners && _codec != null) {
+      if (_nextFrame != null) {
+        // Show the frame decoded while nobody listened instead of skipping it.
+        _scheduleAppFrame();
+      } else if (_framesEmitted == 0 || _codec!.frameCount > 1) {
+        _decodeNextFrameAndSchedule();
+      }
+    }
     super.addListener(listener);
   }
 
@@ -182,56 +224,40 @@ class MultiImageStreamCompleter extends ImageStreamCompleter {
     if (!hasListeners) {
       _timer?.cancel();
       _timer = null;
-      __maybeDispose();
     }
   }
 
-  int __keepAliveHandles = 0;
+  void _replacePendingCodec(ui.Codec? next) {
+    final previous = _nextImageCodec;
+    _nextImageCodec = next;
+    if (previous != next && previous != _codec) previous?.dispose();
+  }
+
+  void _discardNextFrame() {
+    _nextFrame?.image.dispose();
+    _nextFrame = null;
+  }
+
+  static void _disposeCodec(ui.Codec codec) => codec.dispose();
+
+  static void _ignoreCodecError(Object error, StackTrace stack) {}
 
   @override
-  ImageStreamCompleterHandle keepAlive() {
-    final delegateHandle = super.keepAlive();
-    return _MultiImageStreamCompleterHandle(this, delegateHandle);
-  }
-
-  void __maybeDispose() {
-    if (!__hadAtLeastOneListener ||
-        __disposed ||
-        hasListeners ||
-        __keepAliveHandles != 0) {
-      return;
-    }
-
-    __disposed = true;
-
-    _chunkSubscription?.onData(null);
+  void onDisposed() {
+    super.onDisposed();
+    _disposed = true;
+    _timer?.cancel();
+    _timer = null;
+    _discardNextFrame();
+    // Cancelling can drop a codec still being created by the producer. Drain
+    // late results with static callbacks so the stream cannot retain us.
+    _codecSubscription?.onData(_disposeCodec);
+    _codecSubscription?.onError(_ignoreCodecError);
+    _codecSubscription = null;
     _chunkSubscription?.cancel();
     _chunkSubscription = null;
-  }
-}
-
-class _MultiImageStreamCompleterHandle implements ImageStreamCompleterHandle {
-  _MultiImageStreamCompleterHandle(this._completer, this._delegateHandle) {
-    _completer!.__keepAliveHandles += 1;
-  }
-
-  MultiImageStreamCompleter? _completer;
-  final ImageStreamCompleterHandle _delegateHandle;
-
-  /// Call this method to signal the [ImageStreamCompleter] that it can now be
-  /// disposed when its last listener drops.
-  ///
-  /// This method must only be called once per object.
-  @override
-  void dispose() {
-    assert(_completer != null);
-    assert(_completer!.__keepAliveHandles > 0);
-    assert(!_completer!.__disposed);
-
-    _delegateHandle.dispose();
-
-    _completer!.__keepAliveHandles -= 1;
-    _completer!.__maybeDispose();
-    _completer = null;
+    _replacePendingCodec(null);
+    _codec?.dispose();
+    _codec = null;
   }
 }
